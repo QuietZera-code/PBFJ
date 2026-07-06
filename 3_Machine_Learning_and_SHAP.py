@@ -112,3 +112,187 @@ shap.summary_plot(shap_values, X, feature_names=feature_names, show=False, alpha
 plt.title('Fig. 5 SHAP summary plot/Beeswarm plot', pad=15)
 plt.savefig('Fig5_SHAP_Summary.pdf', bbox_inches='tight')
 plt.show()
+
+# =====================================================================
+# Fig. 6: Expanding Window Out-of-Sample Test (Campbell-Thompson R² + Welch-Goyal Curve)
+# =====================================================================
+from sklearn.metrics import r2_score
+
+features_full = ['implied_vol', 'implied_skew_c3', 'implied_kurt_c4']
+target_col = 'future_10d_return'
+
+X_full = df[features_full]
+y_full = df[target_col]
+
+initial_train_size = 252  # 1-year initial training window
+gap_days = 10             # Label isolation gap to avoid look-ahead bias
+
+oos_predictions = []
+oos_actuals = []
+oos_hist_means = []
+oos_dates = []
+
+print("\n=== Running Expanding Window Out-of-Sample Forecasting ===")
+for i in range(initial_train_size, len(df)):
+    train_end_idx = i - gap_days
+    if train_end_idx < 50:
+        continue
+    
+    X_train = X_full.iloc[:train_end_idx]
+    y_train = y_full.iloc[:train_end_idx]
+    X_test = X_full.iloc[i:i+1]
+    y_test = y_full.iloc[i]
+    
+    model_oos = xgb.XGBRegressor(
+        n_estimators=50,
+        learning_rate=0.05,
+        max_depth=3,
+        subsample=0.8,
+        colsample_bytree=0.9,
+        random_state=42,
+        n_jobs=-1
+    )
+    model_oos.fit(X_train, y_train)
+    
+    pred = model_oos.predict(X_test)[0]
+    oos_predictions.append(pred)
+    oos_actuals.append(y_test)
+    oos_hist_means.append(y_train.mean())
+    oos_dates.append(df.index[i])
+    
+    if i % 100 == 0:
+        print(f"Progress: Day {i} / {len(df)}")
+
+# Calculate Campbell-Thompson OOS R²
+oos_actuals = np.array(oos_actuals)
+oos_predictions = np.array(oos_predictions)
+oos_hist_means = np.array(oos_hist_means)
+
+sse_model = np.sum((oos_actuals - oos_predictions) ** 2)
+sse_baseline = np.sum((oos_actuals - oos_hist_means) ** 2)
+r2_oos = 1 - (sse_model / sse_baseline)
+print(f"\n[Core Result] Out-of-Sample R² (Campbell-Thompson): {r2_oos:.4f}")
+
+# Plot Welch-Goyal cumulative SSE difference curve
+diff_sse = (oos_actuals - oos_hist_means) ** 2 - (oos_actuals - oos_predictions) ** 2
+cum_diff_sse = np.cumsum(diff_sse)
+
+fig6, ax = plt.subplots(figsize=(10, 5))
+ax.plot(oos_dates, cum_diff_sse, color='#b2182b', linewidth=2, label='XGBoost OOS Outperformance')
+ax.axhline(0, color='black', linestyle='--', linewidth=1.5)
+
+ax.set_title('Fig. 6 Out-of-Sample Performance: Cumulative SSE Difference (XGBoost vs. Historical Mean)', pad=15)
+ax.set_ylabel('$\Delta$ Cumulative Squared Errors')
+ax.set_xlabel('Out-of-Sample Testing Period')
+ax.grid(True, linestyle='--', alpha=0.5, color='gray')
+ax.legend(loc='upper left', frameon=False)
+
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.savefig('Fig6_OOS_Cumulative_SSE.pdf', bbox_inches='tight')
+plt.close()
+
+# =====================================================================
+# Fig. 7: Incremental Predictability Test (With Traditional Control Variables)
+# =====================================================================
+from jqdata import *
+
+print("\n=== Running Incremental Predictability Test ===")
+
+# Fetch 50ETF spot data for control variables
+start_date_ctrl = (df.index.min() - pd.Timedelta(days=40)).strftime('%Y-%m-%d')
+end_date_ctrl = df.index.max().strftime('%Y-%m-%d')
+
+df_etf_ctrl = get_price(
+    '510050.XSHG',
+    start_date=start_date_ctrl,
+    end_date=end_date_ctrl,
+    frequency='daily',
+    fields=['close', 'volume']
+)
+
+# Construct control variables
+df_etf_ctrl['Ret_Daily'] = df_etf_ctrl['close'].pct_change()
+df_etf_ctrl['HV_20'] = df_etf_ctrl['Ret_Daily'].rolling(20).std() * np.sqrt(252)
+df_etf_ctrl['MOM_10'] = df_etf_ctrl['close'].pct_change(10)
+df_etf_ctrl['Log_Volume'] = np.log(df_etf_ctrl['volume'] + 1)
+
+# Merge with option-implied factors
+df_merged_inc = pd.merge(
+    df,
+    df_etf_ctrl[['HV_20', 'MOM_10', 'Log_Volume']],
+    left_index=True,
+    right_index=True,
+    how='inner'
+).dropna()
+
+features_inc = ['implied_vol', 'implied_skew_c3', 'implied_kurt_c4', 'HV_20', 'MOM_10', 'Log_Volume']
+X_inc = df_merged_inc[features_inc]
+y_inc = df_merged_inc['future_10d_return']
+
+# Strict chronological split (70% train / 30% test)
+split_idx_inc = int(len(df_merged_inc) * 0.7)
+X_train_inc, X_test_inc = X_inc.iloc[:split_idx_inc], X_inc.iloc[split_idx_inc:]
+y_train_inc, y_test_inc = y_inc.iloc[:split_idx_inc], y_inc.iloc[split_idx_inc:]
+
+print(f"Train size: {len(X_train_inc)} | Test size: {len(X_test_inc)}")
+
+# XGBoost with early stopping
+model_inc = xgb.XGBRegressor(
+    n_estimators=150,
+    learning_rate=0.05,
+    max_depth=3,
+    subsample=0.8,
+    colsample_bytree=0.9,
+    random_state=42
+)
+model_inc.fit(
+    X_train_inc, y_train_inc,
+    eval_set=[(X_train_inc, y_train_inc), (X_test_inc, y_test_inc)],
+    early_stopping_rounds=10,
+    verbose=False
+)
+
+# Full-sample R² for comparison
+y_pred_all_inc = model_inc.predict(X_inc)
+r2_all_inc = r2_score(y_inc, y_pred_all_inc)
+print(f"\n[Core Result A] Full-sample R² with control variables: {r2_all_inc:.4f}")
+
+# Feature importance
+importances_inc = model_inc.feature_importances_
+feat_imp_df = pd.DataFrame({'Feature': features_inc, 'Importance': importances_inc})
+feat_imp_df = feat_imp_df.sort_values(by='Importance', ascending=True)
+
+print("\n[Core Result B] Feature Importance Weights:")
+for _, row in feat_imp_df.iloc[::-1].iterrows():
+    print(f"  {row['Feature']:>20}: {row['Importance']:.4f}")
+
+# Plot horizontal bar chart
+fig7, ax = plt.subplots(figsize=(10, 5.5))
+bars = ax.barh(feat_imp_df['Feature'], feat_imp_df['Importance'], color='steelblue', edgecolor='black', alpha=0.8)
+
+# Highlight implied skewness
+for i, feat in enumerate(feat_imp_df['Feature']):
+    if feat == 'implied_skew_c3':
+        bars[i].set_color('firebrick')
+        bars[i].set_edgecolor('black')
+        bars[i].set_alpha(0.9)
+
+ax.set_title('Fig. 7 Incremental Predictability: Feature Importance Comparison', pad=15)
+ax.set_xlabel('Relative Importance (Gain)')
+ax.grid(axis='x', linestyle='--', alpha=0.5, color='#B0B0B0', zorder=0)
+
+for bar in bars:
+    width = bar.get_width()
+    ax.text(width + 0.005, bar.get_y() + bar.get_height()/2, f'{width:.3f}', va='center')
+
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.savefig('Fig7_Incremental_Predictability.pdf', bbox_inches='tight')
+plt.close()
+
+print("\nModule 3 extended: OOS test + incremental test completed.")
