@@ -82,3 +82,63 @@ print(f"{'Annualized Return':<25} | {r_strat*100:.2f}% {'':<3} {r_bench*100:.2f}
 print(f"{'Annualized Volatility':<25} | {v_strat*100:.2f}% {'':<3} {v_bench*100:.2f}% | {cv_strat*100:.2f}% {'':<3} {cv_bench*100:.2f}%")
 print(f"{'Maximum Drawdown':<25} | {d_strat*100:.2f}% {'':<2} {d_bench*100:.2f}% | {cd_strat*100:.2f}% {'':<2} {cd_bench*100:.2f}%")
 print(f"{'Calmar Ratio':<25} | {c_strat:.3f} {'':<4} {c_bench:.3f} | {cc_strat:.3f} {'':<4} {cc_bench:.3f}")
+
+# =====================================================================
+# Fig. 9: Parameter Sensitivity Grid Test (4x4 Robustness Check)
+# =====================================================================
+import seaborn as sns
+
+print("\n=== Running 4x4 Parameter Sensitivity Grid Test ===")
+
+# Calculate daily spot returns for grid backtest
+df_grid = df.copy()
+df_grid['daily_return'] = df_grid['spot_price'].pct_change()
+
+window_list = [30, 45, 60, 90]
+quantile_list = [0.05, 0.10, 0.15, 0.20]
+sharpe_matrix = pd.DataFrame(index=window_list, columns=quantile_list)
+
+for w in window_list:
+    for q in quantile_list:
+        # Rolling quantile threshold
+        threshold = df_grid['implied_skew_c3'].rolling(w).quantile(q)
+        # Signal with 1-day lag to avoid look-ahead bias
+        signal = (df_grid['implied_skew_c3'] > threshold).shift(1).fillna(1)
+        
+        # Strategy returns net of transaction costs
+        strategy_ret = df_grid['daily_return'] * signal
+        rebalance = signal.diff().fillna(0).abs()
+        strategy_ret_net = strategy_ret - (rebalance * TRANSACTION_COST)
+        
+        # Annualized Sharpe Ratio
+        sharpe = (strategy_ret_net.mean() / strategy_ret_net.std()) * np.sqrt(252)
+        sharpe_matrix.loc[w, q] = sharpe
+
+print("\n=== Sharpe Ratio Sensitivity Matrix ===")
+print(sharpe_matrix.astype(float).round(3).to_string())
+
+# Save results
+sharpe_matrix.to_csv('data/robustness_grid_results.csv')
+
+# Plot heatmap
+fig9, ax = plt.subplots(figsize=(8, 6))
+sns.heatmap(
+    sharpe_matrix.astype(float),
+    annot=True,
+    cmap='RdYlGn',
+    fmt=".3f",
+    xticklabels=[f"{int(q*100)}%" for q in quantile_list],
+    yticklabels=window_list,
+    ax=ax,
+    cbar_kws={'label': 'Annualized Sharpe Ratio'}
+)
+
+ax.set_title('Fig. 9 Parameter Sensitivity Matrix of the Tail-Risk Hedging Strategy', pad=15)
+ax.set_xlabel('Skewness Quantile Threshold')
+ax.set_ylabel('Rolling Window Length (Days)')
+
+plt.tight_layout()
+plt.savefig('Fig9_Parameter_Sensitivity_Grid.pdf', bbox_inches='tight')
+plt.close()
+
+print("\nModule 4 extended: Grid sensitivity test completed.")
